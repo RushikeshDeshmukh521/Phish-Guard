@@ -1,87 +1,133 @@
-// A simple WhatsApp bot server using Node.js and Express.
-// It receives messages and echoes them back to the user.
+// A WhatsApp bot that uses the Gemini API to detect spam.
 
 const express = require('express');
 const https = require('https');
 
 const app = express();
-// Middleware to parse JSON request bodies.
 app.use(express.json());
 
 // --- CONFIGURATION ---
-// These values are now loaded from Environment Variables for security and flexibility.
+// Load secrets from Render's Environment Variables
 const WHATSAPP_API_TOKEN = process.env.WHATSAPP_API_TOKEN;
 const VERIFY_TOKEN = process.env.VERIFY_TOKEN;
 const PHONE_NUMBER_ID = process.env.PHONE_NUMBER_ID;
+const GEMINI_API_KEY = process.env.GEMINI_API_KEY; // <-- Your new API key
 
 const PORT = process.env.PORT || 3000;
 
-// Health check endpoint
-app.get('/health', (req, res) => {
-    res.status(200).send('OK');
-});
+// --- GEMINI API FUNCTION ---
+// This new async function calls the Gemini API to analyze the message.
+async function analyzeMessageForSpam(messageText) {
+    // If the API key is missing, we can't proceed.
+    if (!GEMINI_API_KEY) {
+        console.error("GEMINI_API_KEY is not set.");
+        return "Could not analyze the message. Bot is not configured correctly.";
+    }
+
+    const postData = JSON.stringify({
+        "contents": [{
+            "parts": [{
+                // This is the prompt we give the AI. It's very specific.
+                "text": `Analyze the following message to determine if it is spam, a scam, or legitimate. Consider common spam tactics like urgency, suspicious links, and unusual requests. Respond with only one of these three words: SPAM, SCAM, or LEGITIMATE.\n\nMessage: "${messageText}"`
+            }]
+        }]
+    });
+
+    const options = {
+        hostname: 'generativelanguage.googleapis.com',
+        path: `/v1beta/models/gemini-2.5-flash-preview-05-20:generateContent?key=${GEMINI_API_KEY}`,
+        method: 'POST',
+        headers: {
+            'Content-Type': 'application/json'
+        }
+    };
+
+    return new Promise((resolve, reject) => {
+        const req = https.request(options, (res) => {
+            let data = '';
+            res.on('data', (chunk) => data += chunk);
+            res.on('end', () => {
+                try {
+                    const response = JSON.parse(data);
+                    // Extract the AI's response from the complex JSON structure
+                    const result = response.candidates[0].content.parts[0].text.trim();
+                    resolve(result);
+                } catch (error) {
+                    console.error("Error parsing Gemini response:", data);
+                    reject("Error analyzing message.");
+                }
+            });
+        });
+
+        req.on('error', (e) => {
+            console.error("Error calling Gemini API:", e);
+            reject("Could not reach analysis service.");
+        });
+
+        req.write(postData);
+        req.end();
+    });
+}
 
 
-// --- WEBHOOK SETUP ---
-// This endpoint is used by Meta to verify your webhook.
+// --- WEBHOOK ENDPOINTS (Mostly unchanged) ---
 app.get('/', (req, res) => {
+    // Webhook verification logic (unchanged)
     const mode = req.query['hub.mode'];
     const token = req.query['hub.verify_token'];
     const challenge = req.query['hub.challenge'];
-
-    if (mode && token) {
-        if (mode === 'subscribe' && token === VERIFY_TOKEN) {
-            console.log('WEBHOOK_VERIFIED');
-            res.status(200).send(challenge);
-        } else {
-            console.error('Failed validation. Make sure the verify tokens match.');
-            res.sendStatus(403);
-        }
+    if (mode && token && mode === 'subscribe' && token === VERIFY_TOKEN) {
+        res.status(200).send(challenge);
     } else {
-        res.sendStatus(400);
+        res.sendStatus(403);
     }
 });
 
-
-// --- RECEIVE MESSAGES ---
-// This endpoint receives the actual messages from users.
-app.post('/', (req, res) => {
+// This is the main endpoint for receiving messages. It's now an async function.
+app.post('/', async (req, res) => {
     const body = req.body;
 
-    console.log('Incoming webhook:', JSON.stringify(body, null, 2));
+    if (body.object === 'whatsapp_business_account' && body.entry?.[0]?.changes?.[0]?.value?.messages?.[0]) {
+        const message = body.entry[0].changes[0].value.messages[0];
+        
+        if (message.type === 'text') {
+            const from = message.from;
+            const msg_body = message.text.body;
 
-    if (body.object === 'whatsapp_business_account' && body.entry && body.entry.length > 0) {
-        body.entry.forEach(entry => {
-            if (entry.changes && entry.changes.length > 0) {
-                entry.changes.forEach(change => {
-                    if (change.field === 'messages' && change.value.messages && change.value.messages.length > 0) {
-                        const message = change.value.messages[0];
-                        if (message.type === 'text') {
-                            const from = message.from; // Sender's phone number
-                            const msg_body = message.text.body; // The message text
+            console.log(`Analyzing message from ${from}: "${msg_body}"`);
+            
+            try {
+                // Wait for the AI to analyze the message
+                const analysisResult = await analyzeMessageForSpam(msg_body);
+                
+                let reply_body = "";
+                // Create a user-friendly reply based on the AI's response
+                if (analysisResult.includes("SPAM") || analysisResult.includes("SCAM")) {
+                    reply_body = `🚨 *Warning!* This message looks like *${analysisResult}*.\n\nBe careful with links, and do not share personal information.`;
+                } else if (analysisResult.includes("LEGITIMATE")) {
+                    reply_body = `✅ This message seems *LEGITIMATE*.\n\nAs always, remain cautious online.`;
+                } else {
+                    reply_body = `🤔 Analysis complete. The content appears to be: ${analysisResult}.`;
+                }
 
-                            console.log(`Message from ${from}: ${msg_body}`);
-                            sendMessage(from, `You said: "${msg_body}"`);
-                        }
-                    }
-                });
+                sendMessage(from, reply_body);
+
+            } catch (error) {
+                console.error("Error during spam analysis:", error);
+                sendMessage(from, "Sorry, I couldn't analyze that message right now.");
             }
-        });
+        }
     }
-
     res.sendStatus(200);
 });
 
-// --- SEND MESSAGE FUNCTION ---
+// Function to send a message back to the user (unchanged)
 function sendMessage(to, text) {
     const data = JSON.stringify({
         messaging_product: 'whatsapp',
         to: to,
         type: 'text',
-        text: {
-            preview_url: false, // Disables link previews for this message
-            body: text
-        }
+        text: { body: text }
     });
 
     const options = {
@@ -90,34 +136,20 @@ function sendMessage(to, text) {
         method: 'POST',
         headers: {
             'Content-Type': 'application/json',
-            'Content-Length': data.length,
             'Authorization': `Bearer ${WHATSAPP_API_TOKEN}`
         }
     };
 
     const req = https.request(options, res => {
-        console.log(`statusCode: ${res.statusCode}`);
-        let responseBody = '';
-        res.on('data', d => {
-            responseBody += d;
-        });
-        res.on('end', () => {
-             console.log('Response from WhatsApp API:', responseBody);
-        });
+        console.log(`WhatsApp API statusCode: ${res.statusCode}`);
     });
 
-    req.on('error', error => {
-        console.error('Error sending message:', error);
-    });
-
+    req.on('error', error => console.error('Error sending WhatsApp message:', error));
     req.write(data);
     req.end();
 }
 
-
 app.listen(PORT, () => {
     console.log(`Server is listening on port ${PORT}`);
-    if (!WHATSAPP_API_TOKEN || !VERIFY_TOKEN || !PHONE_NUMBER_ID) {
-        console.error("CRITICAL ERROR: Environment variables are not set. Please check your Render configuration.");
-    }
 });
+
