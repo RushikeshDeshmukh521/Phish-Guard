@@ -121,13 +121,16 @@ app.post('/', async (req, res) => {
     res.sendStatus(200);
 });
 
-// Function to send a message back to the user (unchanged)
+// Function to send a message back to the user (FIXED)
 function sendMessage(to, text) {
     const data = JSON.stringify({
         messaging_product: 'whatsapp',
         to: to,
         type: 'text',
-        text: { body: text }
+        text: { 
+            preview_url: true, // <-- This now allows link previews
+            body: text 
+        }
     });
 
     const options = {
